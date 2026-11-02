@@ -42,7 +42,7 @@ def main():
             if frame["session_id"] != state["session_id"]:
                 continue
             camera = frame["camera"]
-            width, height = camera["width"], camera["height"]
+            width, height = int(camera["width"]), int(camera["height"])
             channels = {"rgb8": 3, "rgba8": 4}[frame["encoding"]]
             count += 1
             if cv2 is not None:

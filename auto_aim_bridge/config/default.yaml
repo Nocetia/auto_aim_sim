@@ -1,0 +1,97 @@
+# Algorithm settings shared by exact-corner and rendered-frame observations.
+# The bridge injects calibration and enemy_color from the current state before
+# constructing Solver and Tracker, then saves the resulting effective config.
+
+# Synchronous rendered-frame detector. The bridge resolves these placeholder
+# paths against this config directory and then AUTOAIM_ROOT before constructing
+# YOLO.
+yolo_name: yolov5
+device: CPU
+
+classify_model: assets/tiny_resnet.onnx
+yolov5_model_path: assets/yolov5.xml
+yolov8_model_path: assets/yolov8.xml
+yolo11_model_path: assets/yolo11.xml
+
+min_confidence: 0.8
+use_roi: false
+use_traditional: true
+
+roi:
+  x: 0
+  y: 0
+  width: -1
+  height: -1
+
+# Traditional light-bar thresholds are also required when YOLOv5 constructs
+# its optional corner-refinement detector.
+threshold: 150
+max_angle_error: 45.0
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 10.0
+min_lightbar_length: 8.0
+min_armor_ratio: 1.0
+max_armor_ratio: 5.0
+max_side_ratio: 1.5
+max_rectangular_error: 25.0
+
+# Tracker confirmation and short observation-loss tolerance, in state updates.
+enemy_color: blue
+min_detect_count: 5
+max_temp_lost_count: 15
+outpost_max_temp_lost_count: 75
+
+# Simulator axes: X forward, Y left, Z up. Commands use radians, left-positive
+# yaw and down-positive pitch. These conventions are enforced by the bridge.
+gimbal_yaw_zero: 0.0
+gimbal_pitch_sign: -1.0
+R_gimbal2imubody:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+
+# PnP branch selection and optional Reduced-DoF refinement bounds.
+pnp_yaw_range: [-180.0, 180.0]
+project_error_ratio_thres: 3.0
+reduced_dof_max_yaw_delta: 70.0
+reduced_dof_max_translation_delta: 0.5
+reduced_dof_min_depth: 0.05
+
+# No hardware offsets or artificial inference/transport delays are assumed.
+# The existing trajectory solver fixes gravity at 9.8 m/s^2; it does not read
+# a gravity YAML key. The simulator's default 9.7833 m/s^2 is a small mismatch.
+# The bridge replaces both delay values with the initial state.weapon.delay so
+# aim prediction includes muzzle release delay. Changing it requires a restart.
+yaw_offset: 0.0
+pitch_offset: 0.0
+air_resistance: 0.0
+decision_speed: 7.0
+high_speed_delay_time: 0.0
+low_speed_delay_time: 0.0
+
+# Planner board-selection angles are degrees; speed thresholds are rad/s.
+# "comming_angle" retains the spelling required by the upstream constructor.
+comming_angle: 45.0
+leaving_angle: 20.0
+low_speed_thresh: 1.0
+high_speed_thresh: 2.0
+min_lock_hold_time: 0.15
+switch_margin: 10.0
+
+# Planner fire intent is forwarded only with the explicit --allow-fire option.
+fire_thresh: 0.003
+
+# MPC angular acceleration bounds are rad/s^2.
+max_yaw_acc: 20.0
+Q_yaw: [9000000.0, 0.0]
+R_yaw: [1.0]
+
+max_pitch_acc: 20.0
+Q_pitch: [9000000.0, 0.0]
+R_pitch: [1.0]
