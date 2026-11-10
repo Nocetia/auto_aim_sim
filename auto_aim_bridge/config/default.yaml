@@ -88,10 +88,10 @@ switch_margin: 10.0
 fire_thresh: 0.003
 
 # MPC angular acceleration bounds are rad/s^2.
-max_yaw_acc: 20.0
+max_yaw_acc: 50.0
 Q_yaw: [9000000.0, 0.0]
 R_yaw: [1.0]
 
-max_pitch_acc: 20.0
+max_pitch_acc: 50.0
 Q_pitch: [9000000.0, 0.0]
 R_pitch: [1.0]

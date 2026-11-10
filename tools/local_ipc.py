@@ -98,7 +98,14 @@ class LocalClient:
             time.sleep(.002)
         raise TimeoutError("Waiting for local simulator frame")
 
-    def close(self):
-        if self.state is not None:
+    def close(self, send_stop=True):
+        """Release the client lock.
+
+        Control clients retain the historical default of publishing a stop
+        command.  Read-only clients such as the dataset exporter pass
+        ``send_stop=False`` so they never create or modify command.json.
+        """
+        if send_stop and self.state is not None:
             self.send(control=False)
-        self.lock.close()
+        if not self.lock.closed:
+            self.lock.close()

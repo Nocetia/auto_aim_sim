@@ -12,6 +12,7 @@
 - 接自己的自瞄：[接入指南](docs/integration.md)，包含 Python 接图、C++/OpenCV 适配、内外参和线程建议。
 - C++ 详细接入：[编译与完整示例](docs/cpp_integration.md)，包含文件握手、OpenCV、PnP、控制回读和多线程适配。
 - 自己实现客户端：[完整协议](docs/protocol.md)，包含字段、坐标、时钟、序号、图像握手和失联处理。
+- 生成同步训练数据：[数据集导出器](tools/dataset_export/README.md)，包含 canonical 标签、预览、校验、转换与 episode 级划分。
 - 复现场景：[配置与命令行参考](docs/configuration.md)，列出所有配置项、默认值与范围。
 - 换模型/贴图：[模型说明](docs/models.md)；授权与来源：[第三方声明](THIRD_PARTY_NOTICES.md)。
 
