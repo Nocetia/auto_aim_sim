@@ -17,6 +17,7 @@
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
+#include "uv_control_adapter.hpp"
 
 namespace auto_aim_bridge
 {
@@ -249,6 +250,32 @@ Json describe_detection(const auto_aim::Armor & armor)
   };
 }
 
+Json describe_tracker_measurement(
+  const auto_aim::TrackerMeasurementObservation & measurement)
+{
+  Json diagnostic = {
+    {"valid", measurement.valid},
+    {"source_id", measurement.source_id},
+    {"pnp_position_world", vector_json(measurement.pnp_position_world)},
+    {"pnp_yaw_world", measurement.pnp_yaw_world},
+    {"used_position_world", vector_json(measurement.used_position_world)},
+    {"used_yaw_world", measurement.used_yaw_world}
+  };
+
+  if (measurement.innovation_ypda) {
+    diagnostic["innovation_ypda"] = Json::array({
+      (*measurement.innovation_ypda)[0],
+      (*measurement.innovation_ypda)[1],
+      (*measurement.innovation_ypda)[2],
+      (*measurement.innovation_ypda)[3]
+    });
+  } else {
+    diagnostic["innovation_ypda"] = nullptr;
+  }
+
+  return diagnostic;
+}
+
 bool finite_plan(const auto_aim::Plan & plan)
 {
   const std::array<double, 6> command_values = {
@@ -363,6 +390,19 @@ const char * input_mode_name(InputMode input_mode)
   }
 
   throw std::invalid_argument("Unknown bridge input mode");
+}
+
+const char * estimator_mode_name(EstimatorMode estimator_mode)
+{
+  switch (estimator_mode) {
+    case EstimatorMode::pnp:
+      return "pnp";
+
+    case EstimatorMode::uv_ekf:
+      return "uv-ekf";
+  }
+
+  throw std::invalid_argument("Unknown bridge estimator mode");
 }
 
 namespace
@@ -568,10 +608,12 @@ struct AutoAimPipeline::Implementation
   YAML::Node base_config;
   std::filesystem::path output_directory;
   InputMode input_mode = InputMode::exact_corners;
+  EstimatorMode estimator_mode = EstimatorMode::pnp;
   std::unique_ptr<auto_aim::YOLO> detector;
   std::uint64_t detector_frame_count = 0;
   std::unique_ptr<auto_aim::Solver> solver;
   std::unique_ptr<auto_aim::Tracker> tracker;
+  std::unique_ptr<UvControlAdapter> uv_control_adapter;
   std::unique_ptr<auto_aim::Planner> planner;
   std::optional<std::uint64_t> generation;
   std::string context;
@@ -630,8 +672,17 @@ struct AutoAimPipeline::Implementation
     write_yaml(effective_path, effective_config);
 
     tracker.reset();
+    uv_control_adapter.reset();
     solver = std::make_unique<auto_aim::Solver>(effective_path.string());
     tracker = std::make_unique<auto_aim::Tracker>(effective_path.string(), *solver);
+
+    if (estimator_mode == EstimatorMode::uv_ekf) {
+      uv_control_adapter = std::make_unique<UvControlAdapter>(effective_path);
+
+      tracker->set_debug_measurement_override([this](auto_aim::Armor & armor) {
+        return uv_control_adapter->override_measurement(armor);
+      });
+    }
 
     clock_origin = SteadyClock::now();
     first_sim_time = observation.sim_time;
@@ -662,12 +713,14 @@ struct AutoAimPipeline::Implementation
 AutoAimPipeline::AutoAimPipeline(
   const std::filesystem::path & config_path,
   const std::filesystem::path & output_directory,
-  InputMode input_mode)
+  InputMode input_mode,
+  EstimatorMode estimator_mode)
 : implementation_(std::make_unique<Implementation>())
 {
   implementation_->base_config = YAML::LoadFile(config_path.string());
   implementation_->output_directory = output_directory;
   implementation_->input_mode = input_mode;
+  implementation_->estimator_mode = estimator_mode;
 
   if (!std::filesystem::is_directory(output_directory)) {
     throw std::invalid_argument("Pipeline output directory does not exist");
@@ -771,8 +824,21 @@ PipelineResult AutoAimPipeline::process(
   std::list<auto_aim::Armor> solved_armors = std::move(input_armors);
   pipeline.solver->set_R_gimbal2world(observation.gimbal_to_world);
 
+  if (pipeline.estimator_mode == EstimatorMode::uv_ekf) {
+    if (!pipeline.uv_control_adapter) {
+      throw std::logic_error("UV-EKF estimator has no control adapter");
+    }
+
+    pipeline.uv_control_adapter->prepare_frame(
+      solved_armors,
+      *pipeline.solver,
+      algorithm_time,
+      observation.gimbal_to_world.toRotationMatrix());
+  }
+
   // Tracker performs the production IPPE/refinement path before association.
-  // Never replace these solved positions with simulator 3D truth.
+  // UV mode may replace the selected plate measurement with a pixel-EKF
+  // posterior, but simulator 3D truth is never an algorithm input.
   const auto targets = pipeline.tracker->track(solved_armors, algorithm_time);
   const auto & tracking = pipeline.tracker->observation();
   const std::string tracker_state = pipeline.tracker->state();
@@ -813,18 +879,29 @@ PipelineResult AutoAimPipeline::process(
     armor_diagnostics.push_back(describe_armor(armor, observation.state));
   }
 
+  Json tracker_measurements = Json::array();
+
+  for (const auto & measurement : tracking.measurements) {
+    tracker_measurements.push_back(describe_tracker_measurement(measurement));
+  }
+
   result.diagnostics = {
     {"generation", generation},
     {"source_sim_time", observation.sim_time},
     {"planning_sim_time", observation.sim_time},
     {"tick", observation.state.at("tick")},
     {"input", input_mode_name(pipeline.input_mode)},
+    {"estimator", estimator_mode_name(pipeline.estimator_mode)},
     {"input_armors", input_armor_count},
     {"solved_armors", solved_armors.size()},
     {"detector_ms", detector_milliseconds},
     {"detections", detection_diagnostics},
     {"tracker_state", tracker_state},
     {"measurement_found", tracking.measurement_found},
+    {"tracker_measurements", tracker_measurements},
+    {"uv_ekf", pipeline.uv_control_adapter
+      ? pipeline.uv_control_adapter->diagnostics()
+      : Json(nullptr)},
     {"armors", armor_diagnostics},
     {"plan", plan_diagnostic(result.plan)}
   };

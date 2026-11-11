@@ -1,15 +1,25 @@
 # 仿真自瞄桥接器
 
 `auto_aim_bridge` 将 `rm_aim_sim` 接到 `../auto-aim-new-0` 的实际 Detector、PnP、
-Tracker 和 MPC Planner。运行时可以选择两条输入链路：
+Tracker 和 MPC Planner。输入数据与状态估计器可以在运行时分别选择。
+
+两条输入链路为：
 
 | 输入模式 | 数据源 | 用途 |
 | --- | --- | --- |
-| `exact-corners`（默认） | `state.camera.armors` 的精确 TL/TR/BR/BL | 单独验证 PnP、跟踪、规划和控制 |
-| `raw-frame` | 同一请求的 `frame-*.raw` 与 `frame.json` | 验证渲染图像、YOLO、PnP、跟踪和控制全链路 |
+| `exact-corners`（默认） | `state.camera.armors` 的精确 TL/TR/BR/BL | 单独验证 PnP/UV、跟踪、规划和控制 |
+| `raw-frame` | 同一请求的 `frame-*.raw` 与 `frame.json` | 验证渲染图像、YOLO、所选估计器和控制全链路 |
 
-两条链路只在生成 `std::list<auto_aim::Armor>` 的阶段分流，之后共用同一个 Solver、
-Tracker、Planner、控制新鲜度和开火安全门。`raw-frame` 使用上游同步
+两种状态估计器为：
+
+| 估计器 | 启动参数 | 主要用途 |
+| --- | --- | --- |
+| PnP（默认） | `--estimator=pnp`，也可省略 | 每帧由 Solver/PnP 产生三维装甲板测量，保持原有基线 |
+| 单装甲板 UV-EKF | `--estimator=uv-ekf` | PnP 初始化 UV 分段，后续 UV 状态直接用 TL/TR/BR/BL 像素更新；Tracker 仍以 PnP 完成注入前关联 |
+
+`exact-corners` 与 `raw-frame` 都支持这两种估计器。输入链路只负责生成
+`std::list<auto_aim::Armor>`；估计器完成测量后，仍共用原有 Target、Tracker 状态机、
+Planner、控制新鲜度和开火安全门。`raw-frame` 使用上游同步
 `auto_aim::YOLO(config, false)`；YOLOv5 可继续按 `use_traditional` 对候选角点做传统灯条
 二次修正。
 
@@ -37,17 +47,24 @@ flowchart LR
     Y --> A
     S --> Q[生命周期与最新控制时钟]
     F --> K[同帧 K、D、R、t、姿态、sim_time]
-    K --> P[auto_aim::Solver / PnP]
-    A --> P
-    P --> T[auto_aim::Tracker / EKF]
-    T --> L[auto_aim::Planner / MPC 与弹道]
+    A --> E{--estimator}
+    K --> E
+    E -->|pnp| P[每帧 Solver / PnP]
+    E -->|uv-ekf 未初始化| PS[PnP 初始化种子]
+    E -->|uv-ekf 已初始化| U[SimpleUvEkf<br/>像素关联与更新]
+    PS --> U
+    P --> T[原有 Tracker / Target EKF]
+    U -->|初始化或更新接受| T
+    U -->|无可用更新| TP[Tracker / Target<br/>prediction-only]
+    T --> L[原有 Planner / MPC 与弹道]
+    TP --> L
     Q --> L
     L --> D{运行模式}
     D -->|dry-run| O[只写诊断]
     D -->|--control| M[command.json<br/>绝对角度与前馈]
-    M --> F{--allow-fire 且<br/>Planner 允许开火?}
-    F -->|是| X[持续开火许可]
-    F -->|否| N[fire=false]
+    M --> FD{--allow-fire 且<br/>Planner 允许开火?}
+    FD -->|是| X[持续开火许可]
+    FD -->|否| N[fire=false]
     S -. truth 仅在 exact-corners 完成后评分 .-> O
     F -. camera.armors 只作 raw 诊断基准 .-> O
 ```
@@ -86,17 +103,70 @@ tick 和 `sim_time`。最新 `state.json` 只负责判断发布者生命周期�
 Planner 要外推到的当前仿真时间，绝不会覆盖旧图像的同帧姿态。
 
 `frame.camera.armors` 仍随元数据存在，但 raw 适配器不解析它，也不使用
-`appearance.robot` 生成类别；只有 YOLO 像素输出能进入 PnP。日志可以保留这些理想角点，
-用于检测完成后的离线角点误差评分。
+`appearance.robot` 生成类别；只有 YOLO 像素输出能进入所选估计器。日志可以保留这些
+理想角点，用于检测完成后的离线角点误差评分。
 
-`Tracker::track()` 内部调用实际 `Solver` 完成 IPPE、可选精简自由度优化以及后续关联，
-然后使用原有 EKF 更新目标。桥接器不会用 `state.truth` 的三维位置覆盖 PnP 结果。
+PnP 模式中，`Tracker::track()` 调用实际 `Solver` 完成 IPPE、可选精简自由度优化以及
+后续关联，然后使用原有 EKF 更新目标。UV-EKF 模式只在初始化或重置后的新分段使用 PnP
+种子，具体生命周期见下一节。桥接器不会用 `state.truth` 的三维位置覆盖任何估计结果。
 
 Planner 使用当前输入快照的 `weapon.speed`、`weapon.delay`、显式算法时间和 Tracker
-输出生成 yaw、pitch、角速度、角加速度及开火意图。每次新观测先更新 PnP 和 Tracker，
-算法线程随后按最新已知
-`sim_time` 合并执行最高约 100 Hz 的异步重规划。有效控制结果以约 50 Hz 写回仿真的
-最新值邮箱。
+输出生成 yaw、pitch、角速度、角加速度及开火意图。每次新观测先由所选估计器更新
+Tracker/Target，算法线程随后按最新已知 `sim_time` 合并执行最高约 100 Hz 的异步重规划。
+有效控制结果以约 50 Hz 写回仿真的最新值邮箱。
+
+## 状态估计器切换
+
+### PnP 基线
+
+`--estimator=pnp` 是默认模式。每帧候选角点进入 Solver/PnP，得到世界系装甲板位置和
+姿态，再由原有 Tracker/Target EKF 完成整车状态估计并交给 Planner。这条路径用于与现有
+算法和历史结果直接对照；省略 `--estimator` 与显式写出 `--estimator=pnp` 等价。
+
+### 单装甲板 UV-EKF
+
+`--estimator=uv-ekf` 启用 `auto_aim::SimpleUvEkf`。它维护一个单装甲板状态：
+
+```text
+[X, Y, Z, VX, VY, VZ, armor_yaw, armor_yaw_rate]
+```
+
+每个 UV 分段开始时，桥接器用同一候选的 PnP 位置和姿态初始化位置、yaw 以及固定的
+pitch/roll；初始速度和角速度为零。初始化以后，当前帧 PnP 不再进入 UV 状态，滤波器只用：
+
+- 原始 TL/TR/BR/BL 像素；
+- 当前帧的相机标定与云台到世界旋转；
+- 严格递增的仿真算法时间；
+- 颜色、类别、装甲尺寸和像素创新 NIS 做候选关联。
+
+这里“PnP 只提供 seed”指 UV 滤波状态和最终注入 Target 的板测量。为保留现有 Tracker 的
+候选/板槽关联与诊断边界，Tracker 内部仍可能对 UV 选中的单个候选执行 Solver；该帧 PnP
+的 XYZ/yaw 会保存在 `tracker_measurements[].pnp_*` 供对照，但随后由 UV 后验覆盖，不作为
+`used_*` 测量更新 Target。
+
+当前 measurement override 位于 Tracker 的 Solver 和板槽关联之后，因此当帧 PnP 成功仍是
+UV 后验能够注入的前置门槛，板槽编号也仍由 PnP 关联决定。PnP 求解失败时，即使 UV 像素
+更新已经接受，该帧也不会形成 Tracker 测量；应结合 `measurement_ready`、
+`measurement_injected` 和 `measurement_found` 区分这些阶段。若要彻底移除该依赖，需要在
+上游 Tracker 增加 PnP 前的测量/关联接口，或实现完整整车 UV 观测模型。
+
+只有唯一候选通过像素关联门限，并且 UV 更新被接受时，桥接器才把该单板的世界系
+位置和 yaw 注入原有 Tracker。无检测、关联歧义、重投影/NIS 拒绝时，本帧不会偷偷改用
+PnP 测量，而是让现有 Target 执行 prediction-only。连续拒绝、测量超时、非法时间间隔或
+数值异常会结束当前 UV 分段；后续候选需要重新经过一次 PnP seed 才能建立新分段。
+
+UV-EKF 没有替换整车模型。Tracker 的确认、短时丢失和生命周期状态机仍然生效，原有
+Target 继续维护旋转中心、板槽、半径与高度，Planner 仍只接收原 Target。这样两种估计器
+共用相同的弹道、选板、MPC、控制新鲜度和开火安全门，不会把单板 8 维状态误当成整车
+12 维状态。
+
+两种输入都能使用 UV-EKF：
+
+- `exact-corners + uv-ekf` 用于检查 UV 投影模型、时间和后端控制，不包含神经网络误差；
+- `raw-frame + uv-ekf` 使用 YOLO 输出的实际像素四角，覆盖渲染、检测、UV 更新和控制链。
+
+估计器在进程启动时选择，运行中不会热切换。需要比较 PnP 与 UV-EKF 时，应分别启动两个
+新的运行并使用不同输出目录，避免 Tracker、Planner warm state 和日志相互混合。
 
 ## 坐标、姿态与标定
 
@@ -250,6 +320,7 @@ cmake \
 ```bash
 .tools/auto-aim-bridge/auto_aim_bridge \
   --input=exact-corners \
+  --estimator=pnp \
   --dry-run \
   --duration=10 \
   --output=/tmp/auto_aim_bridge_dry_run
@@ -260,10 +331,15 @@ cmake \
 ```bash
 .tools/auto-aim-bridge/auto_aim_bridge \
   --input=raw-frame \
+  --estimator=pnp \
   --dry-run \
   --duration=10 \
   --output=/tmp/auto_aim_bridge_raw
 ```
+
+要检查 UV-EKF，可以把上述命令中的 `--estimator=pnp` 改为
+`--estimator=uv-ekf`。切换估计器不改变输入源：`exact-corners` 仍来自精确投影，
+`raw-frame` 仍来自 YOLO。
 
 dry-run 是默认模式，因此可以省略 `--dry-run`。两种输入都会运行到 Planner 和诊断记录，
 但不会创建或发布 `command.json`，云台不会因桥接器而运动。
@@ -274,24 +350,40 @@ dry-run 是默认模式，因此可以省略 `--dry-run`。两种输入都会运
 logs/auto_aim_bridge_<Unix毫秒>_<进程号>/
 ```
 
-终端会打印当前模式、channel、输出目录和 generation，并每秒报告一次仿真时间、Tracker
-状态、控制许可及最近计划角度。它适合快速确认程序仍在工作，定量分析应使用输出文件。
+终端会打印当前运行模式、输入、estimator、channel、输出目录和 generation，并每秒报告
+一次仿真时间、Tracker 状态、控制许可及最近计划角度。它适合快速确认程序仍在工作，
+定量分析应使用输出文件。
 
 ## 开启云台闭环
 
-确认 dry-run 的 PnP 和规划输出正常后，退出前一个桥接器，再运行：
+确认 dry-run 的估计器和规划输出正常后，退出前一个桥接器，再开启闭环。以下两条命令均
+省略 `--duration`，会持续运行到按下 Ctrl+C；也省略 `--output`，每次自动创建新的日志
+目录。
+
+精确角点加 UV-EKF：
+
+```bash
+.tools/auto-aim-bridge/auto_aim_bridge \
+  --input=exact-corners \
+  --estimator=uv-ekf \
+  --control
+```
+
+真实图像、YOLO 加 UV-EKF：
 
 ```bash
 .tools/auto-aim-bridge/auto_aim_bridge \
   --input=raw-frame \
-  --control \
-  --duration=10 \
-  --output=/tmp/auto_aim_bridge_control
+  --estimator=uv-ekf \
+  --control
 ```
 
-将 `--input=raw-frame` 改成 `--input=exact-corners`，即可用理想角点运行同一闭环。实际图像
-模式中检测或跟踪短暂失效时，安全门会发布 `control=false, fire=false`，新鲜检测重新确认
-后才恢复控制。
+要持续运行原 PnP 基线，把 `--estimator=uv-ekf` 改成 `--estimator=pnp`，或直接省略该参数。
+`raw-frame` 必须配合前台图形仿真，不能使用 `--headless`。
+
+实际图像模式中检测或跟踪短暂失效时，安全门会发布 `control=false, fire=false`，新鲜检测
+重新确认后才恢复控制。UV-EKF 更新拒绝时同样只做预测，不会因为控制已开启而回退到 PnP
+测量。
 
 控制输出使用协议定义的绝对弧度：yaw 向左为正，pitch 向下为正。桥接器从有效配置中
 强制设置：
@@ -308,10 +400,14 @@ gimbal_pitch_sign: -1.0
 
 ## 允许 Planner 开火
 
-确认仅控制模式稳定后，再显式增加 `--allow-fire`：
+上述持续运行命令默认都没有 `--allow-fire`，因此只控制云台而不会开火。先检查日志、云台
+跟随、UV 更新接受率和 Tracker 状态；确认仅控制模式稳定后，再在原命令末尾显式增加
+`--allow-fire`：
 
 ```bash
 .tools/auto-aim-bridge/auto_aim_bridge \
+  --input=exact-corners \
+  --estimator=uv-ekf \
   --control \
   --allow-fire
 ```
@@ -348,6 +444,7 @@ Usage: auto_aim_bridge [options]
 
   --channel=NAME      仿真 IPC channel，默认 default
   --input=MODE        exact-corners（默认）或 raw-frame
+  --estimator=MODE    pnp（默认）或 uv-ekf
   --config=PATH       Detector/Tracker/Planner 基础 YAML，默认 config/default.yaml
   --output=PATH       新建或空的日志目录
   --duration=SECONDS  按墙钟运行指定秒数；省略时运行到 Ctrl+C
@@ -359,7 +456,7 @@ Usage: auto_aim_bridge [options]
 
 `--dry-run` 与 `--control` 不能同时使用，`--allow-fire` 不能脱离 `--control` 使用。
 `--duration` 必须是有限正数。channel 只能包含 1 到 80 个英文字母、数字、下划线或
-连字符。非法输入模式会直接退出，不会自动退回理想角点。
+连字符。非法输入模式或估计器名称会直接退出，不会自动退回理想角点或 PnP。
 
 ## 配置的来源与覆盖规则
 
@@ -393,6 +490,14 @@ MPC 参数。每次建立新 generation 时，桥接器复制基础 YAML，并�
 当前默认使用 `assets/yolov5.xml` 的装甲板输出格式；`assets/best2-sim.onnx` 是 buff 五关键点
 模型，输出契约不同，不能直接替换装甲板 YOLO 路径。
 
+`uv-ekf` 另外读取 `uv_ekf` 和 `uv_ekf_association` 配置组。前者包含像素噪声、线/角
+加速度噪声、初始协方差、最大 dt、重投影门限和 NIS 概率；后者包含无测量超时、最大连续
+拒绝帧数、候选关联 NIS 门限以及第一名与第二名的歧义门限。相机 K、畸变和手眼外参仍由
+当前 generation 的输入快照覆盖，并写入同一份 `effective_config_<generation>.yaml`。
+
+这些门限同时作用于 `exact-corners` 和 `raw-frame`，但两者的像素误差分布并不相同。
+比较时应保留有效配置和 estimator 模式，不应只比较命中率而忽略 UV 更新接受率与重置次数。
+
 基础配置中的 `Q_yaw`、`Q_pitch` 必须分别包含两个数，`R_yaw`、`R_pitch` 必须分别包含
 一个数。桥接器在启动时检查这些形状和正值约束，避免上游 TinyMPC 读取越界。
 
@@ -409,10 +514,11 @@ raw 邮箱同一时间只有一个请求在途。服务器发布新帧后会在�
 所以主线程必须先完成像素复制和 BGR 转换。等待帧超过 5 秒会报错并提示使用图形模式；
 控制新鲜度仍按 100/200 ms 门限更早撤销旧计划，不会等到 5 秒才停控。
 
-新 Observation 负责 PnP、Tracker/EKF 和目标确认。只要状态、generation 和结果仍然
-有效，主线程就每 10 ms 请求一次以当前最新 `sim_time` 重规划。算法线程串行处理观测与
-规划，请求繁忙时会合并，因此 100 Hz 是目标上限，不是硬实时保证。命令循环每 20 ms
-检查一次最新计划，目标发送上限约为 50 Hz。
+新 Observation 根据 estimator 模式执行每帧 PnP，或执行 UV 初始化/预测/像素更新，然后
+进入 Tracker/Target 和目标确认。只要状态、generation 和结果仍然有效，主线程就每
+10 ms 请求一次以当前最新 `sim_time` 重规划。算法线程串行处理观测与规划，请求繁忙时会
+合并，因此 100 Hz 是目标上限，不是硬实时保证。命令循环每 20 ms 检查一次最新计划，
+目标发送上限约为 50 Hz。
 
 Tracker 和 Planner 需要 `steady_clock` 类型时间。每个 generation 会把第一帧
 `sim_time` 锚定到一个本地 steady 时间点，后续只使用仿真时间差推进算法。暂停、重置或
@@ -433,7 +539,7 @@ publisher 的后续 publication，客户端使用本地单调接收时间判断�
 - `sim_time` 回退。
 
 切换 generation 时，桥接器还取消待处理 frame 请求，清除待处理观测和旧控制结果，并
-重建 Solver、Tracker。
+重建 Solver、Tracker 和所选估计器。UV-EKF 不会跨 generation 保留单板状态或 PnP seed。
 Planner 的目标选择会通过空目标调用清除。由于上游 Planner 重复构造会泄漏其原始
 求解器句柄，当前实现保留同一个 Planner，TinyMPC 的内部 warm state 也会保留。新控制
 仍须等待当前 generation 的新鲜 Tracker 结果，但严格隔离 MPC 内部状态的实验应重启
@@ -472,7 +578,7 @@ state 和 command 都是最新值邮箱，不是消息队列。状态 publicatio
 
 | 文件 | 内容 |
 | --- | --- |
-| `run.json` | channel、控制/开火开关、输入模式、Detector 后端、配置路径、构建选项和源码版本 |
+| `run.json` | channel、控制/开火开关、输入模式、`estimator`、Detector 后端、配置路径、构建选项和源码版本 |
 | `detector_config.yaml` | raw 模式实际加载的 YOLO 配置和绝对模型路径；exact 模式不生成 |
 | `effective_config_<N>.yaml` | generation N 使用的实时标定、坐标约定和算法参数 |
 | `observations.jsonl` | 每个已处理观测的完整 state/frame 元数据和算法诊断；不复制大体积 raw 像素 |
@@ -483,11 +589,29 @@ state 和 command 都是最新值邮箱，不是消息队列。状态 publicatio
 
 - 输入模式、generation、`source_sim_time`、`planning_sim_time`、tick 和总处理耗时；
 - `detector_ms`、Detector 原始类别/颜色/置信度、四角点与可选传统修正角点；
-- Detector/精确角点输入数量和完成 PnP 的装甲数量；
+- Detector/精确角点输入数量和实际交给 Tracker 的候选数量；
 - Tracker 状态及本帧是否得到测量；
+- `tracker_measurements` 中 Solver 的 `pnp_position_world/pnp_yaw_world`、实际进入 Target 的
+  `used_position_world/used_yaw_world`，以及可用的 `innovation_ypda`；
 - `target_age_at_plan_ms` 和 `measurement_age_at_plan_ms`；
-- 每块板的 PnP 位置、yaw，以及存在 truth 时的评分误差；
+- `armors` 中 Tracker 候选列表在处理后的位姿与 truth 评分；UV 初始化 hook 可能改写该列表，
+  判断 Target 实际使用的测量应以 `tracker_measurements[].used_*` 为准；
 - Planner 的控制意图、内部开火意图、目标板索引和完整控制轨迹。
+
+每条结果顶层的 `estimator` 明确记录本帧走 `pnp` 还是 `uv-ekf`。UV 模式还包含
+`uv_ekf` 诊断对象，主要字段为：
+
+- `segment_id`、`status`、`selected_source_id`；
+- 初始化、预测、更新、重置是否发生或成功；
+- `measurement_ready`：当前 UV 结果是否可以作为 Target 测量；
+- `measurement_injected`：override 是否已把该测量交给 Tracker 的 Target 更新路径；它不
+  单独代表 Target EKF 已接受，后者还要检查 `measurement_found`；
+- `pre_update_rmse_px`、`post_update_rmse_px` 和 `nis`；
+- `state`、`covariance_diagonal` 和 `processing_ms`。
+
+判断 UV 是否参与控制时，不能只看 `uv_ekf.initialized` 或存在状态值；应同时检查本帧
+`measurement_ready`、`measurement_injected`、Tracker 是否接受测量以及最终控制新鲜度。
+更新拒绝但保留预测状态的帧不会伪装成新测量。
 
 观测日志中的计划在该观测的 `source_sim_time` 生成。观测之间的 100 Hz 重规划结果用于
 实时命令，并通过下面的命令日志保存，不为同一 state 反复追加观测日志行。
@@ -510,10 +634,10 @@ state 和 command 都是最新值邮箱，不是消息队列。状态 publicatio
 状态改变后应重新运行 CMake 配置，才能刷新 `run.json` 中的记录。`dirty` 只表示是否有
 修改，不保存具体 diff；做对比实验时仍应保留完整构建命令和工作区差异。
 
-当前诊断保存 Detector 输入角点、最终 PnP 位置、最终 yaw 和可用的真值误差，但没有保存
-原始 IPPE 多解、所选分支、分支重投影误差、精简自由度/BA 优化是否接受以及优化代价。
-因此 JSONL 可以评估检测角点和最终位姿，却不能定位 IPPE 分支或 refinement 阶段的问题；
-比较这些阶段时需要另加上游 Solver 诊断。
+当前诊断保存 Detector 输入角点、Tracker 所选测量的原始 PnP 与最终 `used_*` 位姿，以及
+可用的真值误差，但没有保存原始 IPPE 多解、所选分支、分支重投影误差、精简自由度/BA
+优化是否接受以及优化代价。因此 JSONL 可以评估检测角点和最终测量，却不能定位 IPPE
+分支或 refinement 阶段的问题；比较这些阶段时需要另加上游 Solver 诊断。
 
 ## 验证
 
@@ -527,7 +651,12 @@ ctest \
 
 `bridge_test` 覆盖角点与车型映射、非法输入拒绝、合成投影的 PnP 精度、truth 对计划输出
 无影响、raw 模式不读取理想角点/车型标签、RGB/RGBA 邮箱复制与错误长度拒绝、图像尺寸
-校验、确认门限、持续丢失和 generation 重启等行为。
+校验、确认门限、持续丢失和 generation 重启等行为。它还覆盖 UV-EKF 的 PnP 初始化、
+像素更新注入、无候选时不回退 PnP、连续拒绝后的重置与重新 seed，以及新 generation
+重新建立 UV 分段。
+
+`simple_uv_ekf_test` 直接复用上游数学测试，覆盖大小装甲投影、数值 Jacobian、带畸变相机、
+运动与不规则时间间隔、缺测、NIS/重投影拒绝、协方差半正定性和非法配置保护。
 
 准备好 `.tools/godot` 后，可以运行真实无界面仿真的闭环 smoke test：
 
@@ -571,6 +700,17 @@ live smoke 使用临时目录，成功或失败退出后都会清理场景配置
 
 ## 当前限制
 
+- `SimpleUvEkf` 是单装甲板恒速度/恒角速度近似，不是完整整车 UV 模型。板面切换、两个
+  同类候选接近或高角速度遮挡时，可能出现关联歧义、重置和重新 PnP seed。
+- UV 初始化时从 PnP 固定 pitch/roll，后续只估计单板位置和 yaw。目标存在明显俯仰、
+  横滚或非刚性角点误差时，像素残差可能被错误分配到深度与 yaw。
+- UV 输出仍要经过原有 Target/Tracker 才进入 Planner。这保留了整车几何与控制接口，
+  但属于两级估计，当前不会把 UV 的完整协方差直接替代 Target 的测量噪声模型。
+- UV 更新被拒绝时不会回退到当前帧 PnP；短时间内由 Target 预测继续控制，超过新鲜度门限
+  则撤销控制。日志中出现较少的 PnP 结果不代表系统卡死，应先检查 `uv_ekf.status`、
+  `measurement_ready`、`measurement_injected` 和重置次数。
+- 现有静态或理想角点结果不能证明 UV-EKF 一定优于 PnP。正式比较至少应固定相同输入、
+  标定、时间戳、场景和配置，并分别统计三维误差、像素残差、控制中断和命中率。
 - 默认 `exact-corners` 仍是理想二维角点；要评价 Detector 必须显式使用 `raw-frame` 和
   图形模式。
 - 默认 YOLO 模型来自当前 `AUTOAIM_ROOT`，检测结果受模型版本、渲染材质、曝光、目标
@@ -613,6 +753,7 @@ live smoke 使用临时目录，成功或失败退出后都会清理场景配置
 | `Unsupported appearance.robot` | exact 模式只支持英雄、步兵 3/4/5 和哨兵预设；raw 类别来自 Detector |
 | 运行后没有控制 | dry-run 不发送指令；控制模式还需 `--remote`、新鲜 state、Tracker 曾进入 `tracking`、测量总年龄不超过 100 ms，且计划落后当前状态不超过 30 ms |
 | raw 能检测但控制偶尔撤销 | 查看 `detector_ms`、`detections`、Tracker 状态和测量年龄；检测/PnP 抖动触发失配时，撤销旧控制是预期安全行为 |
+| UV-EKF 已初始化但没有新测量 | 检查 `uv_ekf.status`、`selected_source_id`、NIS、更新前 RMSE、`measurement_ready` 和 `measurement_injected`；拒绝帧按设计 prediction-only，不会回退 PnP |
 | 有控制但不开火 | 确认同时使用 `--control --allow-fire`，并检查命令日志中的 Tracker 状态、`planner_fire_intent` 和实际 `fire`；`temp_lost` 不允许开火 |
 | 开火一段时间后停止 | 检查 `health.alive` 和 `stats.kills`；默认目标被击毁后不再提供理想角点，可恢复或提高 `target.max_health` |
 | 控制偶尔变为 false | 检查 Tracker 是否完成过确认、`measurement_age_at_plan_ms`、处理耗时，以及命令的 source/planning/state 三个仿真时间 |

@@ -23,6 +23,7 @@ namespace
 {
 
 using auto_aim_bridge::Json;
+using auto_aim_bridge::EstimatorMode;
 using auto_aim_bridge::InputMode;
 using auto_aim_bridge::Observation;
 using auto_aim_bridge::PipelineResult;
@@ -41,6 +42,7 @@ struct Options
   std::filesystem::path config_path = BRIDGE_DEFAULT_CONFIG_PATH;
   std::filesystem::path output_directory;
   InputMode input_mode = InputMode::exact_corners;
+  EstimatorMode estimator_mode = EstimatorMode::pnp;
   double duration_seconds = 0.0;
   bool control = false;
   bool allow_fire = false;
@@ -69,6 +71,17 @@ Options parse_options(int argument_count, char ** arguments)
       options.config_path = argument.substr(9);
     } else if (argument.rfind("--output=", 0) == 0) {
       options.output_directory = argument.substr(9);
+    } else if (argument.rfind("--estimator=", 0) == 0) {
+      const std::string estimator_name = argument.substr(12);
+
+      if (estimator_name == "pnp") {
+        options.estimator_mode = EstimatorMode::pnp;
+      } else if (estimator_name == "uv-ekf") {
+        options.estimator_mode = EstimatorMode::uv_ekf;
+      } else {
+        throw std::invalid_argument(
+          "--estimator must be pnp or uv-ekf");
+      }
     } else if (argument.rfind("--input=", 0) == 0) {
       const std::string input_name = argument.substr(8);
 
@@ -112,6 +125,7 @@ void print_help()
     << "Usage: auto_aim_bridge [options]\n\n"
     << "  --channel=NAME      Simulator IPC channel (default: default)\n"
     << "  --input=MODE        exact-corners (default) or raw-frame\n"
+    << "  --estimator=MODE    pnp (default) or uv-ekf\n"
     << "  --config=PATH       Detector/Tracker/Planner YAML (default: bundled config/default.yaml)\n"
     << "  --output=PATH       New or empty log directory\n"
     << "  --duration=SECONDS  Stop after this wall-clock duration; otherwise Ctrl+C\n"
@@ -173,9 +187,10 @@ public:
   AlgorithmWorker(
     const std::filesystem::path & config_path,
     const std::filesystem::path & output_directory,
-    InputMode input_mode)
-  : thread_([this, config_path, output_directory, input_mode] {
-      run(config_path, output_directory, input_mode);
+    InputMode input_mode,
+    EstimatorMode estimator_mode)
+  : thread_([this, config_path, output_directory, input_mode, estimator_mode] {
+      run(config_path, output_directory, input_mode, estimator_mode);
     })
   {
   }
@@ -235,13 +250,15 @@ private:
   void run(
     const std::filesystem::path & config_path,
     const std::filesystem::path & output_directory,
-    InputMode input_mode)
+    InputMode input_mode,
+    EstimatorMode estimator_mode)
   {
     try {
       auto_aim_bridge::AutoAimPipeline pipeline(
         config_path,
         output_directory,
-        input_mode);
+        input_mode,
+        estimator_mode);
       auto observations_log = open_log(output_directory / "observations.jsonl");
 
       while (true) {
@@ -343,6 +360,7 @@ int run(const Options & options)
     {"control_enabled", options.control},
     {"fire_enabled", options.allow_fire},
     {"input", auto_aim_bridge::input_mode_name(options.input_mode)},
+    {"estimator", auto_aim_bridge::estimator_mode_name(options.estimator_mode)},
     {"detector", options.input_mode == InputMode::raw_frame
       ? Json({
           {"backend", "auto_aim::YOLO"},
@@ -361,7 +379,7 @@ int run(const Options & options)
       {"dirty", BRIDGE_AUTOAIM_DIRTY != 0}
     }},
     {"reduced_dof_pnp", AUTOAIM_USE_REDUCED_DOF_PNP != 0},
-    {"uv_ekf", false}
+    {"uv_ekf", options.estimator_mode == EstimatorMode::uv_ekf}
   }).dump(2) << '\n';
 
   run_info.close();
@@ -376,7 +394,8 @@ int run(const Options & options)
   AlgorithmWorker worker(
     config_path,
     output_directory,
-    options.input_mode);
+    options.input_mode,
+    options.estimator_mode);
   auto_aim_bridge::LocalSimClient client(options.channel);
 
   const auto started_at = SteadyClock::now();
@@ -399,6 +418,8 @@ int run(const Options & options)
 
   std::cout << "Auto-aim bridge: " << operating_mode << '\n'
             << "Input: " << auto_aim_bridge::input_mode_name(options.input_mode) << '\n'
+            << "Estimator: "
+            << auto_aim_bridge::estimator_mode_name(options.estimator_mode) << '\n'
             << "Channel: " << options.channel << '\n'
             << "Logs: " << output_directory << '\n';
 

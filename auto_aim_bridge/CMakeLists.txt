@@ -40,6 +40,7 @@ set(AUTOAIM_ALGORITHM_SOURCES
   tasks/auto_aim/pnp_reprojection.cpp
   tasks/auto_aim/reduced_dof_pnp_solver.cpp
   tasks/auto_aim/ba_solver.cpp
+  tasks/auto_aim/simple_uv_ekf.cpp
   tasks/auto_aim/target.cpp
   tasks/auto_aim/tracker.cpp
   tasks/auto_aim/planner/planner.cpp
@@ -135,7 +136,7 @@ add_library(autoaim_algorithms STATIC
 
 target_compile_definitions(autoaim_algorithms PUBLIC
   AUTOAIM_USE_REDUCED_DOF_PNP=$<BOOL:${AUTOAIM_USE_REDUCED_DOF_PNP}>
-  AUTOAIM_ENABLE_UV_EKF=0
+  AUTOAIM_ENABLE_UV_EKF=1
 )
 
 target_include_directories(autoaim_algorithms PUBLIC "${AUTOAIM_SOURCE_ROOT}")
@@ -165,6 +166,7 @@ target_link_libraries(autoaim_algorithms INTERFACE
 add_library(bridge_core STATIC
   src/sim_adapter.cpp
   src/sim_client.cpp
+  src/uv_control_adapter.cpp
 )
 
 target_include_directories(bridge_core PUBLIC
@@ -243,7 +245,21 @@ if(BUILD_TESTING)
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     TIMEOUT 30
   )
+
+  add_executable(
+    simple_uv_ekf_test
+    "${AUTOAIM_SOURCE_ROOT}/tests/simple_uv_ekf_test.cpp"
+  )
+  target_link_libraries(simple_uv_ekf_test PRIVATE autoaim_algorithms)
+  target_compile_options(simple_uv_ekf_test PRIVATE -Wall -Wextra -Wpedantic)
+
+  add_test(NAME simple_uv_ekf_test COMMAND simple_uv_ekf_test)
+  set_tests_properties(simple_uv_ekf_test PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    TIMEOUT 30
+  )
 endif()
 
 message(STATUS "Auto-aim sources: ${AUTOAIM_SOURCE_ROOT}")
 message(STATUS "Reduced-DoF PnP: ${AUTOAIM_USE_REDUCED_DOF_PNP}")
+message(STATUS "UV-EKF estimator: built (runtime selection defaults to pnp)")

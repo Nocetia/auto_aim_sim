@@ -41,6 +41,33 @@ min_detect_count: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 
+# Optional single-armor UV observation EKF. The bridge always builds this
+# implementation, but uses it only with --estimator=uv-ekf. PnP supplies the
+# initialization seed; accepted updates subsequently use TL/TR/BR/BL pixels.
+uv_ekf:
+  pixel_noise_std_px: 2.0
+  linear_acceleration_std_mps2: 12.0
+  angular_acceleration_std_radps2: 30.0
+  initial_position_std_m: 0.25
+  initial_velocity_std_mps: 4.0
+  initial_yaw_std_rad: 0.35
+  initial_yaw_rate_std_radps: 10.0
+  min_depth_m: 0.1
+  max_dt_s: 0.1
+  max_reprojection_rmse_px: 50.0
+  nis_gate_probability: 0.999
+  position_jacobian_step_m: 0.0001
+  yaw_jacobian_step_rad: 0.00001
+
+# The bridge uses these gates to choose one unambiguous frame-local candidate
+# for the single-armor UV filter and to reset it after sustained rejection.
+uv_ekf_association:
+  missing_timeout_s: 0.15
+  max_rejected_frames: 5
+  nis_gate: 26.124481558
+  second_best_ratio: 1.5
+  min_nis_margin: 1.0
+
 # Simulator axes: X forward, Y left, Z up. Commands use radians, left-positive
 # yaw and down-positive pitch. These conventions are enforced by the bridge.
 gimbal_yaw_zero: 0.0

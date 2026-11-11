@@ -28,6 +28,14 @@ enum class InputMode
 
 const char * input_mode_name(InputMode input_mode);
 
+enum class EstimatorMode
+{
+  pnp,
+  uv_ekf
+};
+
+const char * estimator_mode_name(EstimatorMode estimator_mode);
+
 struct Observation
 {
   Json state;
@@ -78,7 +86,8 @@ public:
   AutoAimPipeline(
     const std::filesystem::path & config_path,
     const std::filesystem::path & output_directory,
-    InputMode input_mode = InputMode::exact_corners);
+    InputMode input_mode = InputMode::exact_corners,
+    EstimatorMode estimator_mode = EstimatorMode::pnp);
 
   ~AutoAimPipeline();
 

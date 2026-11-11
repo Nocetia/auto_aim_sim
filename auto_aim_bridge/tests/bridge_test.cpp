@@ -24,6 +24,7 @@ namespace
 {
 
 using auto_aim_bridge::AutoAimPipeline;
+using auto_aim_bridge::EstimatorMode;
 using auto_aim_bridge::Json;
 using auto_aim_bridge::PipelineResult;
 
@@ -197,6 +198,65 @@ Eigen::Vector3d vector_from_json(const Json & value)
     value.at(0).get<double>(),
     value.at(1).get<double>(),
     value.at(2).get<double>());
+}
+
+void require_finite_json_vector(
+  const Json & value,
+  std::size_t expected_size,
+  const std::string & explanation)
+{
+  require(
+    value.is_array() && value.size() == expected_size,
+    explanation + ": unexpected vector shape");
+
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    require(
+      value.at(index).is_number() &&
+        std::isfinite(value.at(index).get<double>()),
+      explanation + ": component " + std::to_string(index) + " is not finite");
+  }
+}
+
+void require_uv_measurement_matches_state(
+  const PipelineResult & result,
+  const Json & uv_diagnostics,
+  const std::string & explanation)
+{
+  require(
+    result.diagnostics.at("measurement_found").get<bool>(),
+    explanation + ": Tracker did not accept a measurement");
+
+  const Json & measurements = result.diagnostics.at("tracker_measurements");
+  require(
+    measurements.is_array() && measurements.size() == 1,
+    explanation + ": expected exactly one Tracker measurement");
+
+  const Json & measurement = measurements.at(0);
+  const Json & uv_state = uv_diagnostics.at("state");
+  require(
+    measurement.at("valid").get<bool>(),
+    explanation + ": Tracker recorded an invalid measurement");
+  require(
+    measurement.at("source_id").get<std::uint64_t>() ==
+      uv_diagnostics.at("selected_source_id").get<std::uint64_t>(),
+    explanation + ": Tracker and UV candidate identities differ");
+
+  for (std::size_t axis = 0; axis < 3; ++axis) {
+    require_near(
+      measurement.at("used_position_world").at(axis).get<double>(),
+      uv_state.at(axis).get<double>(),
+      1e-12,
+      explanation + ": UV position was not used by Tracker");
+  }
+
+  require_near(
+    std::remainder(
+      measurement.at("used_yaw_world").get<double>() -
+        uv_state.at(6).get<double>(),
+      2.0 * kPi),
+    0.0,
+    1e-12,
+    explanation + ": UV yaw was not used by Tracker");
 }
 
 Json make_projected_state(
@@ -754,6 +814,292 @@ void test_projected_pose(const TemporaryDirectory & temporary_directory)
   }
 }
 
+void test_default_pnp_estimator_diagnostics(
+  const TemporaryDirectory & temporary_directory)
+{
+  AutoAimPipeline pipeline(
+    BRIDGE_DEFAULT_CONFIG_PATH,
+    temporary_directory.child("default_pnp_estimator"));
+
+  Json state = make_projected_state();
+  set_frame_time(state, 0);
+
+  const PipelineResult result = pipeline.process(
+    auto_aim_bridge::adapt_state(state),
+    1);
+
+  require(
+    result.diagnostics.at("estimator").get<std::string>() == "pnp",
+    "The backward-compatible pipeline constructor must select the PnP estimator");
+  require(
+    result.tracker_state == "detecting",
+    "The default PnP estimator must preserve the existing confirmation lifecycle");
+  require(
+    !result.plan.control && !result.plan.fire,
+    "The default PnP estimator must preserve the first-frame confirmation gate");
+  require(
+    result.diagnostics.at("uv_ekf").is_null(),
+    "The default PnP estimator must not construct or advance the UV filter");
+
+  const Json & measurements = result.diagnostics.at("tracker_measurements");
+  require(
+    result.diagnostics.at("measurement_found").get<bool>() &&
+      measurements.is_array() && measurements.size() == 1,
+    "The default PnP estimator must provide exactly one accepted measurement");
+
+  const Json & measurement = measurements.at(0);
+
+  for (std::size_t axis = 0; axis < 3; ++axis) {
+    require_near(
+      measurement.at("used_position_world").at(axis).get<double>(),
+      measurement.at("pnp_position_world").at(axis).get<double>(),
+      1e-12,
+      "The default estimator must pass the PnP position through unchanged");
+  }
+
+  require_near(
+    measurement.at("used_yaw_world").get<double>(),
+    measurement.at("pnp_yaw_world").get<double>(),
+    1e-12,
+    "The default estimator must pass the PnP yaw through unchanged");
+
+  single_solved_armor(result);
+}
+
+void test_uv_estimator_lifecycle(const TemporaryDirectory & temporary_directory)
+{
+  const auto output_directory = temporary_directory.child("uv_estimator");
+  AutoAimPipeline pipeline(
+    BRIDGE_DEFAULT_CONFIG_PATH,
+    output_directory,
+    auto_aim_bridge::InputMode::exact_corners,
+    EstimatorMode::uv_ekf);
+
+  Json state = make_projected_state();
+  set_frame_time(state, 0);
+
+  PipelineResult result = pipeline.process(
+    auto_aim_bridge::adapt_state(state),
+    1);
+
+  require(
+    result.diagnostics.at("estimator").get<std::string>() == "uv-ekf",
+    "The selected UV estimator must be recorded in diagnostics");
+
+  const Json & initialization = result.diagnostics.at("uv_ekf");
+  require(
+    initialization.at("initialized").get<bool>(),
+    "The first valid PnP measurement must seed the UV estimator");
+  require(
+    initialization.at("initialization_frame").get<bool>(),
+    "The UV seed frame must be marked as an initialization frame");
+  require(
+    !initialization.at("prediction_succeeded").get<bool>() &&
+      !initialization.at("update_attempted").get<bool>() &&
+      !initialization.at("update_accepted").get<bool>(),
+    "The UV seed frame must not masquerade as a predict/update frame");
+  require(
+    initialization.at("measurement_injected").get<bool>(),
+    "The initialized UV state must supply the Tracker measurement");
+  require(
+    !initialization.at("reset").get<bool>(),
+    "A clean UV initialization must not be reported as a runtime reset");
+  require(
+    initialization.at("selected_source_id").get<std::uint64_t>() ==
+      static_cast<std::uint64_t>(kPhysicalArmorId),
+    "UV initialization must retain the selected frame-local candidate identity");
+  require(
+    initialization.at("status").is_string() &&
+      !initialization.at("status").get<std::string>().empty(),
+    "UV initialization must expose a nonempty status");
+
+  require_finite_json_vector(
+    initialization.at("state"),
+    8,
+    "UV initialization state");
+  require_finite_json_vector(
+    initialization.at("covariance_diagonal"),
+    8,
+    "UV initialization covariance");
+  require_uv_measurement_matches_state(
+    result,
+    initialization,
+    "UV initialization");
+
+  require(
+    result.tracker_state == "detecting" && !result.plan.control,
+    "UV initialization must still obey Tracker confirmation");
+
+  const YAML::Node config = YAML::LoadFile(BRIDGE_DEFAULT_CONFIG_PATH);
+  const int minimum_detection_count = config["min_detect_count"].as<int>();
+  require(
+    minimum_detection_count > 1,
+    "The UV lifecycle fixture requires a multi-frame confirmation gate");
+
+  for (int frame_index = 1; frame_index < minimum_detection_count; ++frame_index) {
+    set_frame_time(state, frame_index);
+    result = pipeline.process(
+      auto_aim_bridge::adapt_state(state),
+      1);
+
+    const Json & update = result.diagnostics.at("uv_ekf");
+    require(
+      update.at("initialized").get<bool>() &&
+        !update.at("initialization_frame").get<bool>(),
+      "UV must remain initialized after its seed frame");
+    require(
+      update.at("prediction_succeeded").get<bool>(),
+      "Each later UV frame must predict to the observation timestamp");
+    require(
+      update.at("update_attempted").get<bool>() &&
+        update.at("update_accepted").get<bool>(),
+      "Exact projected corners must pass the UV update gates");
+    require(
+      update.at("measurement_injected").get<bool>(),
+      "An accepted UV posterior must replace the Tracker measurement");
+    require(
+      update.at("selected_source_id").get<std::uint64_t>() ==
+        static_cast<std::uint64_t>(kPhysicalArmorId),
+      "UV updates must report the selected candidate identity");
+
+    require_finite_json_vector(update.at("state"), 8, "UV posterior state");
+    require_finite_json_vector(
+      update.at("covariance_diagonal"),
+      8,
+      "UV posterior covariance");
+    require_uv_measurement_matches_state(
+      result,
+      update,
+      "UV update");
+  }
+
+  require(
+    result.tracker_state == "tracking",
+    "Accepted UV measurements must satisfy the normal Tracker confirmation gate");
+  require(
+    result.plan.control,
+    "A confirmed UV-backed target must reach the existing Planner control path");
+  check_finite_plan(result.plan);
+
+  Json rejected_state = state;
+  Json & rejected_corners = rejected_state["camera"]["armors"][0]["corners"];
+
+  for (Json & corner : rejected_corners) {
+    corner[0] = corner.at(0).get<double>() + 100.0;
+  }
+
+  set_frame_time(rejected_state, minimum_detection_count);
+  result = pipeline.process(
+    auto_aim_bridge::adapt_state(rejected_state),
+    1);
+
+  const Json & rejected = result.diagnostics.at("uv_ekf");
+  require(
+    rejected.at("initialized").get<bool>() &&
+      rejected.at("prediction_succeeded").get<bool>(),
+    "A rejected UV observation must retain the predicted estimator state");
+  require(
+    !rejected.at("update_attempted").get<bool>() &&
+      !rejected.at("update_accepted").get<bool>() &&
+      !rejected.at("measurement_injected").get<bool>(),
+    "A candidate outside the UV association gate must not reach Tracker as a measurement");
+  require(
+    rejected.at("selected_source_id").is_null(),
+    "A rejected UV frame must not claim a selected source identity");
+  require(
+    rejected.at("status").get<std::string>() == "no_pixel_match",
+    "The rejected UV frame must expose its association failure");
+  require(
+    result.diagnostics.at("input_armors").get<int>() == 1 &&
+      result.diagnostics.at("solved_armors").get<int>() == 0,
+    "UV rejection must clear the Tracker observation instead of falling back to PnP");
+  require(
+    !result.diagnostics.at("measurement_found").get<bool>() &&
+      result.tracker_state == "temp_lost",
+    "UV rejection must drive the established track through prediction-only temporary loss");
+
+  const int maximum_rejected_frames =
+    config["uv_ekf_association"]["max_rejected_frames"].as<int>();
+  require(
+    maximum_rejected_frames > 1,
+    "The rejection-reset fixture requires more than one rejected frame");
+
+  for (int rejection_index = 1;
+       rejection_index < maximum_rejected_frames;
+       ++rejection_index) {
+    set_frame_time(
+      rejected_state,
+      minimum_detection_count + rejection_index);
+    result = pipeline.process(
+      auto_aim_bridge::adapt_state(rejected_state),
+      1);
+  }
+
+  const Json & rejection_reset = result.diagnostics.at("uv_ekf");
+  require(
+    rejection_reset.at("reset").get<bool>() &&
+      !rejection_reset.at("initialized").get<bool>() &&
+      rejection_reset.at("state").is_null(),
+    "Sustained UV rejection must reset the current filter segment");
+  require(
+    rejection_reset.at("status").get<std::string>() ==
+      "rejection_limit_no_pixel_match",
+    "The rejection-limit reset must retain its concrete cause");
+
+  set_frame_time(
+    state,
+    minimum_detection_count + maximum_rejected_frames);
+  result = pipeline.process(
+    auto_aim_bridge::adapt_state(state),
+    1);
+
+  const Json & reseeded = result.diagnostics.at("uv_ekf");
+  require(
+    reseeded.at("initialized").get<bool>() &&
+      reseeded.at("initialization_frame").get<bool>() &&
+      reseeded.at("measurement_injected").get<bool>(),
+    "The first valid frame after a rejection reset must establish a new PnP seed");
+  require_uv_measurement_matches_state(
+    result,
+    reseeded,
+    "UV rejection recovery");
+
+  Json restarted_state = make_projected_state();
+  restarted_state["session_id"] = "uv-restarted-session";
+  set_frame_time(restarted_state, 0, 1.0);
+
+  result = pipeline.process(
+    auto_aim_bridge::adapt_state(restarted_state),
+    2);
+
+  const Json & restarted = result.diagnostics.at("uv_ekf");
+  require(result.generation == 2, "UV results must identify the new generation");
+  require(
+    restarted.at("initialized").get<bool>() &&
+      restarted.at("initialization_frame").get<bool>(),
+    "A generation change must discard the old UV state and initialize a new segment");
+  require(
+    !restarted.at("prediction_succeeded").get<bool>() &&
+      !restarted.at("update_attempted").get<bool>(),
+    "A new generation must not continue predicting the preceding UV segment");
+  require(
+    restarted.at("measurement_injected").get<bool>(),
+    "The new UV generation must seed the new Tracker measurement");
+  require(
+    restarted.at("selected_source_id").get<std::uint64_t>() ==
+      static_cast<std::uint64_t>(kPhysicalArmorId),
+    "The restarted UV segment must select the new generation's candidate");
+  require(
+    result.tracker_state == "detecting" && !result.plan.control,
+    "A generation reset must also restart Tracker confirmation and control gating");
+
+  require_finite_json_vector(restarted.at("state"), 8, "Restarted UV state");
+  require_finite_json_vector(
+    restarted.at("covariance_diagonal"),
+    8,
+    "Restarted UV covariance");
+}
+
 void test_truth_independence(const TemporaryDirectory & temporary_directory)
 {
   AutoAimPipeline with_truth(
@@ -995,6 +1341,12 @@ int main()
 
     test_projected_pose(temporary_directory);
     std::cout << "PASS: small and large armor PnP under nonzero gimbal attitude\n";
+
+    test_default_pnp_estimator_diagnostics(temporary_directory);
+    std::cout << "PASS: default pipeline selects and reports the PnP estimator\n";
+
+    test_uv_estimator_lifecycle(temporary_directory);
+    std::cout << "PASS: UV estimator initializes, updates, controls and resets by generation\n";
 
     test_truth_independence(temporary_directory);
     std::cout << "PASS: PnP, tracker and planner do not depend on ground truth\n";
