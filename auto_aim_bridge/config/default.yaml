@@ -2,6 +2,12 @@
 # The bridge injects calibration and enemy_color from the current state before
 # constructing Solver and Tracker, then saves the resulting effective config.
 
+# false: Planner uses Target/KF angular velocity (production baseline).
+# true: Planner uses the signed, same-snapshot Godot yaw rate when it is valid
+# and fresh. Missing, mismatched or stale GT disables planning instead of
+# silently falling back to the KF value.
+use_ground_truth_angular_velocity: true
+
 # Synchronous rendered-frame detector. The bridge resolves these placeholder
 # paths against this config directory and then AUTOAIM_ROOT before constructing
 # YOLO.

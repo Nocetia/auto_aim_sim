@@ -24,6 +24,11 @@ namespace auto_aim_bridge
 namespace
 {
 
+constexpr std::int64_t SIMULATOR_TARGET_ID = 0;
+constexpr double MAX_SIMULATOR_ANGULAR_VELOCITY_RAD_S = 25.0;
+constexpr double SNAPSHOT_TIME_TOLERANCE_SECONDS = 1e-6;
+constexpr double MAX_PREDICTION_AGE_SECONDS = 0.1;
+
 double finite_number(const Json & value, const std::string & field)
 {
   if (!value.is_number()) {
@@ -37,6 +42,140 @@ double finite_number(const Json & value, const std::string & field)
   }
 
   return number;
+}
+
+struct GroundTruthParseResult
+{
+  std::optional<GroundTruthAngularVelocitySample> sample;
+  std::string status = "missing";
+};
+
+GroundTruthParseResult parse_ground_truth_angular_velocity(
+  const Json & state,
+  double sim_time)
+{
+  GroundTruthParseResult result;
+
+  if (!state.contains("ground_truth_angular_velocity")) {
+    return result;
+  }
+
+  const auto & value = state.at("ground_truth_angular_velocity");
+
+  if (!value.is_object()) {
+    result.status = "not_an_object";
+    return result;
+  }
+
+  for (const std::string field : {
+         "target_id", "robot_id", "timestamp", "tick", "yaw_rad_s"}) {
+    if (!value.contains(field)) {
+      result.status = "missing_" + field;
+      return result;
+    }
+  }
+
+  const auto & target_id = value.at("target_id");
+  bool known_target_id = false;
+
+  if (target_id.is_number_unsigned()) {
+    known_target_id = target_id.get<std::uint64_t>() ==
+      static_cast<std::uint64_t>(SIMULATOR_TARGET_ID);
+  } else if (target_id.is_number_integer()) {
+    known_target_id = target_id.get<std::int64_t>() == SIMULATOR_TARGET_ID;
+  }
+
+  if (!known_target_id) {
+    result.status = "unsupported_target_id";
+    return result;
+  }
+
+  const auto & robot_id = value.at("robot_id");
+
+  if (!robot_id.is_string()) {
+    result.status = "invalid_robot_id";
+    return result;
+  }
+
+  const auto & tick = value.at("tick");
+  const auto & packet_tick = state.at("tick");
+
+  const bool tick_is_integer = tick.is_number_integer() || tick.is_number_unsigned();
+  const bool packet_tick_is_integer =
+    packet_tick.is_number_integer() || packet_tick.is_number_unsigned();
+
+  if (!tick_is_integer || !packet_tick_is_integer || tick != packet_tick) {
+    result.status = "tick_mismatch";
+    return result;
+  }
+
+  if (!value.at("timestamp").is_number()) {
+    result.status = "invalid_timestamp";
+    return result;
+  }
+
+  const double timestamp = value.at("timestamp").get<double>();
+
+  if (!std::isfinite(timestamp) ||
+      std::abs(timestamp - sim_time) > SNAPSHOT_TIME_TOLERANCE_SECONDS) {
+    result.status = "timestamp_mismatch";
+    return result;
+  }
+
+  if (!value.at("yaw_rad_s").is_number()) {
+    result.status = "invalid_angular_velocity";
+    return result;
+  }
+
+  const double yaw_rad_s = value.at("yaw_rad_s").get<double>();
+
+  if (!std::isfinite(yaw_rad_s) ||
+      std::abs(yaw_rad_s) > MAX_SIMULATOR_ANGULAR_VELOCITY_RAD_S) {
+    result.status = "angular_velocity_out_of_range";
+    return result;
+  }
+
+  const std::string packet_robot_id = state.at("appearance").at("robot").get<std::string>();
+  const std::string sample_robot_id = robot_id.get<std::string>();
+
+  if (sample_robot_id != packet_robot_id) {
+    result.status = "robot_id_mismatch";
+    return result;
+  }
+
+  const auto & session_id = state.at("session_id");
+
+  if (!session_id.is_string()) {
+    result.status = "invalid_session_id";
+    return result;
+  }
+
+  std::uint64_t tick_number = 0;
+
+  if (tick.is_number_unsigned()) {
+    tick_number = tick.get<std::uint64_t>();
+  } else {
+    const std::int64_t signed_tick = tick.get<std::int64_t>();
+
+    if (signed_tick < 0) {
+      result.status = "invalid_tick";
+      return result;
+    }
+
+    tick_number = static_cast<std::uint64_t>(signed_tick);
+  }
+
+  result.sample = GroundTruthAngularVelocitySample{
+    session_id.get<std::string>(),
+    SIMULATOR_TARGET_ID,
+    sample_robot_id,
+    tick_number,
+    timestamp,
+    yaw_rad_s
+  };
+  result.status = "valid_snapshot";
+
+  return result;
 }
 
 std::vector<double> numeric_array(
@@ -82,6 +221,17 @@ int robot_number(const std::string & robot)
   }
 
   throw std::invalid_argument("Unsupported appearance.robot: " + robot);
+}
+
+bool target_name_matches_robot(
+  auto_aim::ArmorName target_name,
+  const std::string & robot)
+{
+  return (robot == "hero" && target_name == auto_aim::ArmorName::one) ||
+         (robot == "sentry" && target_name == auto_aim::ArmorName::sentry) ||
+         (robot == "infantry_3" && target_name == auto_aim::ArmorName::three) ||
+         (robot == "infantry_4" && target_name == auto_aim::ArmorName::four) ||
+         (robot == "infantry_5" && target_name == auto_aim::ArmorName::five);
 }
 
 void initialize_lightbar(
@@ -477,6 +627,12 @@ Observation adapt_packet(
       "Camera and gimbal must belong to the same valid simulation snapshot");
   }
 
+  const GroundTruthParseResult ground_truth =
+    parse_ground_truth_angular_velocity(state, observation.sim_time);
+
+  observation.ground_truth_angular_velocity = ground_truth.sample;
+  observation.ground_truth_angular_velocity_status = ground_truth.status;
+
   observation.bullet_speed = finite_number(weapon.at("speed"), "weapon.speed");
   observation.firing_delay = finite_number(weapon.at("delay"), "weapon.delay");
 
@@ -609,6 +765,7 @@ struct AutoAimPipeline::Implementation
   std::filesystem::path output_directory;
   InputMode input_mode = InputMode::exact_corners;
   EstimatorMode estimator_mode = EstimatorMode::pnp;
+  bool use_ground_truth_angular_velocity = false;
   std::unique_ptr<auto_aim::YOLO> detector;
   std::uint64_t detector_frame_count = 0;
   std::unique_ptr<auto_aim::Solver> solver;
@@ -617,11 +774,14 @@ struct AutoAimPipeline::Implementation
   std::unique_ptr<auto_aim::Planner> planner;
   std::optional<std::uint64_t> generation;
   std::string context;
+  std::string session_id;
   SteadyClock::time_point clock_origin;
   double first_sim_time = 0.0;
   std::optional<double> previous_sim_time;
   bool was_confirmed_tracking = false;
   std::optional<auto_aim::Target> target_for_planning;
+  std::optional<GroundTruthAngularVelocitySample> latest_ground_truth_angular_velocity;
+  std::string latest_ground_truth_angular_velocity_status = "not_processed";
   double latest_measurement_age_seconds = std::numeric_limits<double>::infinity();
   double latest_bullet_speed = 0.0;
   std::optional<double> planner_firing_delay;
@@ -665,6 +825,8 @@ struct AutoAimPipeline::Implementation
     effective_config["gimbal_pitch_sign"] = -1.0;
     effective_config["high_speed_delay_time"] = observation.firing_delay;
     effective_config["low_speed_delay_time"] = observation.firing_delay;
+    effective_config["use_ground_truth_angular_velocity"] =
+      use_ground_truth_angular_velocity;
 
     const auto effective_path = output_directory /
       ("effective_config_" + std::to_string(next_generation) + ".yaml");
@@ -689,6 +851,8 @@ struct AutoAimPipeline::Implementation
     previous_sim_time.reset();
     was_confirmed_tracking = false;
     target_for_planning.reset();
+    latest_ground_truth_angular_velocity.reset();
+    latest_ground_truth_angular_velocity_status = "not_processed";
     latest_measurement_age_seconds = std::numeric_limits<double>::infinity();
     latest_bullet_speed = observation.bullet_speed;
     latest_result = {};
@@ -707,6 +871,7 @@ struct AutoAimPipeline::Implementation
 
     generation = next_generation;
     context = observation.context;
+    session_id = observation.state.at("session_id").get<std::string>();
   }
 };
 
@@ -721,6 +886,13 @@ AutoAimPipeline::AutoAimPipeline(
   implementation_->output_directory = output_directory;
   implementation_->input_mode = input_mode;
   implementation_->estimator_mode = estimator_mode;
+
+  const YAML::Node ground_truth_mode =
+    implementation_->base_config["use_ground_truth_angular_velocity"];
+
+  if (ground_truth_mode) {
+    implementation_->use_ground_truth_angular_velocity = ground_truth_mode.as<bool>();
+  }
 
   if (!std::filesystem::is_directory(output_directory)) {
     throw std::invalid_argument("Pipeline output directory does not exist");
@@ -778,6 +950,10 @@ PipelineResult AutoAimPipeline::process(
   }
 
   pipeline.previous_sim_time = observation.sim_time;
+  pipeline.latest_ground_truth_angular_velocity = observation.ground_truth_angular_velocity;
+  pipeline.latest_ground_truth_angular_velocity_status =
+    observation.ground_truth_angular_velocity_status;
+
   const auto algorithm_time = pipeline.algorithm_time(observation.sim_time);
 
   const auto detector_started_at = SteadyClock::now();
@@ -872,6 +1048,8 @@ PipelineResult AutoAimPipeline::process(
   result.planning_sim_time = observation.sim_time;
   result.observation_received_at = observation.received_at;
   result.tracker_state = tracker_state;
+  result.ground_truth_angular_velocity_enabled =
+    pipeline.use_ground_truth_angular_velocity;
 
   Json armor_diagnostics = Json::array();
 
@@ -937,8 +1115,57 @@ PipelineResult AutoAimPipeline::replan(
   const double measurement_age = pipeline.latest_measurement_age_seconds + target_age;
   std::optional<auto_aim::Target> target;
 
-  if (measurement_age <= 0.1 && pipeline.target_for_planning) {
+  if (measurement_age <= MAX_PREDICTION_AGE_SECONDS && pipeline.target_for_planning) {
     target = pipeline.target_for_planning;
+  }
+
+  std::optional<double> omega_kf;
+  std::optional<double> omega_gt;
+  std::optional<double> omega_prediction;
+  std::optional<double> ground_truth_age_seconds;
+  std::optional<std::uint64_t> tracker_target_id;
+  std::string angular_velocity_source = "no_target";
+  std::string ground_truth_status = pipeline.latest_ground_truth_angular_velocity_status;
+  bool ground_truth_valid_for_prediction = false;
+
+  if (pipeline.latest_ground_truth_angular_velocity) {
+    const auto & ground_truth = *pipeline.latest_ground_truth_angular_velocity;
+    omega_gt = ground_truth.yaw_rad_s;
+    ground_truth_age_seconds = planning_sim_time - ground_truth.timestamp;
+
+    if (*ground_truth_age_seconds < -SNAPSHOT_TIME_TOLERANCE_SECONDS) {
+      ground_truth_status = "timestamp_in_future";
+    } else if (*ground_truth_age_seconds > MAX_PREDICTION_AGE_SECONDS) {
+      ground_truth_status = "stale";
+    } else if (ground_truth.session_id != pipeline.session_id) {
+      ground_truth_status = "session_id_mismatch";
+    } else if (ground_truth.target_id != SIMULATOR_TARGET_ID) {
+      ground_truth_status = "target_id_mismatch";
+    } else if (target && !target_name_matches_robot(target->name, ground_truth.robot_id)) {
+      ground_truth_status = "tracked_target_mismatch";
+    } else if (target) {
+      ground_truth_status = "valid_for_prediction";
+      ground_truth_valid_for_prediction = true;
+    }
+  }
+
+  if (target) {
+    omega_kf = target->ekf_x()[7];
+    tracker_target_id = target->track_id;
+
+    if (pipeline.use_ground_truth_angular_velocity) {
+      if (ground_truth_valid_for_prediction) {
+        target = target->prediction_copy_with_angular_velocity(*omega_gt);
+        omega_prediction = omega_gt;
+        angular_velocity_source = "ground_truth";
+      } else {
+        target.reset();
+        angular_velocity_source = "ground_truth_unavailable";
+      }
+    } else {
+      omega_prediction = omega_kf;
+      angular_velocity_source = "kalman_filter";
+    }
   }
 
   PipelineResult result = pipeline.latest_result;
@@ -955,6 +1182,36 @@ PipelineResult AutoAimPipeline::replan(
   result.diagnostics["planning_sim_time"] = planning_sim_time;
   result.diagnostics["target_age_at_plan_ms"] = target_age * 1000.0;
   result.diagnostics["measurement_age_at_plan_ms"] = measurement_age * 1000.0;
+  result.diagnostics["omega_kf"] = omega_kf ? Json(*omega_kf) : Json(nullptr);
+  result.diagnostics["omega_gt"] = omega_gt ? Json(*omega_gt) : Json(nullptr);
+  result.diagnostics["omega_prediction"] =
+    omega_prediction ? Json(*omega_prediction) : Json(nullptr);
+  result.diagnostics["angular_velocity_source"] = angular_velocity_source;
+  result.diagnostics["ground_truth_angular_velocity"] = {
+    {"enabled", pipeline.use_ground_truth_angular_velocity},
+    {"status", ground_truth_status},
+    {"valid_for_prediction", ground_truth_valid_for_prediction},
+    {"maximum_age_ms", MAX_PREDICTION_AGE_SECONDS * 1000.0},
+    {"age_ms", ground_truth_age_seconds
+      ? Json(*ground_truth_age_seconds * 1000.0)
+      : Json(nullptr)},
+    {"tracker_target_id", tracker_target_id
+      ? Json(*tracker_target_id)
+      : Json(nullptr)}
+  };
+
+  if (pipeline.latest_ground_truth_angular_velocity) {
+    const auto & ground_truth = *pipeline.latest_ground_truth_angular_velocity;
+    Json & ground_truth_diagnostics =
+      result.diagnostics["ground_truth_angular_velocity"];
+
+    ground_truth_diagnostics["session_id"] = ground_truth.session_id;
+    ground_truth_diagnostics["target_id"] = ground_truth.target_id;
+    ground_truth_diagnostics["robot_id"] = ground_truth.robot_id;
+    ground_truth_diagnostics["tick"] = ground_truth.tick;
+    ground_truth_diagnostics["timestamp"] = ground_truth.timestamp;
+  }
+
   result.diagnostics["plan"] = plan_diagnostic(result.plan);
 
   pipeline.latest_result = result;

@@ -476,6 +476,15 @@ MPC 参数。每次建立新 generation 时，桥接器复制基础 YAML，并�
 覆盖后的配置写入 `effective_config_<generation>.yaml`，Solver 和 Tracker 从该文件重建。
 当前弹速不写死在 YAML 中，而是每次调用 Planner 时从对应观测快照传入。
 
+`use_ground_truth_angular_velocity` 控制 Planner 的角速度来源，默认 `false`，即继续使用
+Target/KF 的 `x[7]`。设为 `true` 后，桥接器只在 Godot 的同帧 GT 对象存在、数值有限、
+timestamp/tick 新鲜且 `(publisher_id, session_id, target_id, robot_id)` 与当前唯一目标匹配时，
+给 Planner 的值语义预测副本附加 GT yaw 角速度；Tracker 持有的 Target 和 KF 状态不变。
+任一校验失败都会令本次 Planner 收到 no-target 并输出 `control=false`，不会自动退回 KF。
+主线程还会用最新 state 和最近提交 observation 的 GT 解析状态关闭异步交接窗口，避免 worker
+处理失效包之前继续发布旧计划。该门只在 GT 模式生效。该开关与 `--input`、`--estimator`
+正交；修改自定义 YAML 后仍通过原有 `--config=PATH` 启动。
+
 `raw-frame` 另外读取以下 Detector 配置：
 
 - `yolo_name`：`yolov5`、`yolov8` 或 `yolo11`；默认 `yolov5`；
@@ -594,6 +603,8 @@ state 和 command 都是最新值邮箱，不是消息队列。状态 publicatio
 - `tracker_measurements` 中 Solver 的 `pnp_position_world/pnp_yaw_world`、实际进入 Target 的
   `used_position_world/used_yaw_world`，以及可用的 `innovation_ypda`；
 - `target_age_at_plan_ms` 和 `measurement_age_at_plan_ms`；
+- `omega_kf`、`omega_gt`、`omega_prediction` 和 `angular_velocity_source`，以及
+  `ground_truth_angular_velocity` 中的身份、时间、年龄和有效性状态；
 - `armors` 中 Tracker 候选列表在处理后的位姿与 truth 评分；UV 初始化 hook 可能改写该列表，
   判断 Target 实际使用的测量应以 `tracker_measurements[].used_*` 为准；
 - Planner 的控制意图、内部开火意图、目标板索引和完整控制轨迹。
@@ -619,8 +630,10 @@ state 和 command 都是最新值邮箱，不是消息队列。状态 publicatio
 每个 `commands.jsonl` 记录都对应一次确实写入邮箱的命令，包含准确的 `seq`、实际发布的
 `control` 和 `fire`、Tracker 状态、`planner_fire_intent`，以及 `source_sim_time`、
 `planning_sim_time`、`state_sim_time`。客户端可能因 state 已经过期把请求的控制和开火
-降为 false，日志记录的是降级后的实际值。暂停或 IPC 禁用时没有记录，因为此时根本不
-写包。程序退出时的尽力停止包不经过主循环，可能不出现在该日志中。
+降为 false，日志记录的是降级后的实际值；同一行还复制 `omega_kf`、`omega_gt`、
+`omega_prediction`、`angular_velocity_source` 和 `ground_truth_inputs_current`，便于确认实际
+预测来源及最新输入门。暂停或 IPC 禁用时没有记录，因为此时根本不写包。程序退出时的尽力
+停止包不经过主循环，可能不出现在该日志中。
 
 `ipc_feedback` 是发送该行指令时客户端已知的最近一次 state 反馈，并不是对同一行新指令
 的同步确认。需要在后续 state 中检查 `ipc.last_seq`、`received`、`rejected` 和实际姿态。

@@ -5,6 +5,7 @@ const Presets = preload("res://scripts/presets.gd")
 const MAX_COLLISION_DT = 0.001
 const MAX_PROJECTILES = 512
 const HIT_FLASH_DURATION = 0.05
+const TARGET_ID = 0
 
 var settings: Dictionary
 var time = 0.0
@@ -205,6 +206,16 @@ func target_pose(at: float) -> Dictionary:
 		var motion = _translation_state(at)
 		center += Vector3(cos(t.heading), sin(t.heading), 0.0) * float(motion.offset)
 	return {"center": center, "angle": rotation_origin + (t.omega * (motion_at - rotation_epoch) if t.rotate else 0.0)}
+
+
+func target_yaw_angular_velocity(at: float) -> float:
+	if not settings.target.rotate:
+		return 0.0
+
+	if motion_stop_time >= 0.0 and at >= motion_stop_time:
+		return 0.0
+
+	return float(settings.target.omega)
 
 
 func armor_pose(index: int, at: float) -> Dictionary:
@@ -472,6 +483,12 @@ func snapshot() -> Dictionary:
 		"health": {"current": health, "maximum": max_health, "alive": health > 0,
 			"death_time": death_time},
 		"appearance": settings.appearance.duplicate(),
+		"ground_truth_angular_velocity": {
+			"target_id": TARGET_ID,
+			"robot_id": settings.appearance.robot,
+			"timestamp": time,
+			"tick": tick,
+			"yaw_rad_s": target_yaw_angular_velocity(time)},
 		"truth": {"center": vec(pose.center), "angle": pose.angle, "armors": armors},
 		"camera": camera_observation(), "stats": metrics(), "events": events.duplicate(true)}
 

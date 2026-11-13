@@ -97,6 +97,7 @@ direction = [cos(pitch)*cos(yaw), cos(pitch)*sin(yaw), -sin(pitch)]
 | `weapon` | 弹速、射频、发射延迟、枪管长度、重力、单发基础伤害 `damage` |
 | `health` | 当前血量 `current`、上限 `maximum`、存活 `alive`、战亡仿真时间 `death_time`（未战亡为 -1） |
 | `appearance` | 车型、红蓝方、外观模型配置 |
+| `ground_truth_angular_velocity` | 当前唯一靶车的同帧真实 yaw 角速度及目标身份，供仿真算法对照 |
 | `truth` | 当前靶车中心、旋转角、四块装甲中心与外法向，仅供调试评分 |
 | `camera` | 当前虚拟相机的理想标定和可见装甲关键点 |
 | `stats` | 累计出膛、命中、各类未命中、飞行/待出膛、命中率、实际扣血 `damage`、击毁 `kills` |
@@ -115,12 +116,27 @@ direction = [cos(pitch)*cos(yaw), cos(pitch)*sin(yaw), -sin(pitch)]
 | `weapon` | `speed` m/s、`rate` Hz、`delay` s、`barrel_length` m、`gravity` m/s²、`damage` HP；不包含 lifetime |
 | `health` | `current/maximum` 整数 HP，`alive` boolean，`death_time` 仿真秒，未死亡为 -1 |
 | `appearance` | `robot/team/armor_model/body_model` 字符串、`armor_scale/body_scale` 数值；body 字段为不加载的历史配置 |
+| `ground_truth_angular_velocity` | `target_id` 当前固定为 0；`robot_id` 与 `appearance.robot` 相同；`timestamp/tick` 必须与外层快照相同；`yaw_rad_s` 为有符号 rad/s，当前范围 [-25, 25] |
 | `truth` | `center` 轨迹当前中心 `[x,y,z]`；`angle` 当前旋转角 rad；`armors` 始终有 4 个元素 |
 | `truth.armors[]` | `id` 0–3；`center` 装甲中心；`normal` 外侧单位法向；`normal_yaw` 外法向方位角 |
 | `ipc`（状态） | `enabled` boolean，`status` 显示文本，`last_seq` 最近有效序号，`received/rejected` 累计接收/拒绝次数 |
 | `camera` | 见相机字段表；图像不在 state.json 内 |
 
 不要将 `ipc.status` 中文文本当作稳定的枚举。`enabled` 只表示外部模式开启，不表示当前一定有有效目标或云台正在跟踪。接收/拒绝计数是 bridge 生命周期累计值，不应假设重置本轮后归零。
+
+`ground_truth_angular_velocity.yaw_rad_s` 直接来自靶车解析运动生成器，不由 PnP、图像差分或
+滤波器反推。旋转关闭或目标战亡并冻结后为 0；其余时间等于场景的 `target.omega`。世界系为
+X 前、Y 左、Z 上，正值表示绕 +Z 从 +X 转向 +Y，负值表示相反方向。时间戳使用仿真时间，
+不使用主机墙钟。
+
+当前仿真只有一个敌方机器人，完整实例身份是
+`(publisher_id, session_id, target_id)`；`robot_id` 再标明车型/编号。
+`camera.armors[].id` 和 `truth.armors[].id` 的 0–3 仅是该车的板面编号，不能当作机器人 ID。
+消费者必须把 GT 与产生视觉观测的同一个 state/frame 快照绑定，并校验 timestamp、tick、
+发布者、会话和目标身份。该顶层对象是 v2 的向后兼容扩展；旧消费者可以忽略。
+
+paused 包的 sim_time 和姿态不推进，`yaw_rad_s` 保留暂停时间轴前的仿真状态速度；它不是相对
+主机墙钟的速度。消费者不得用 paused 包继续预测或控制。
 
 ### 统计
 
@@ -208,7 +224,11 @@ direction = [cos(pitch)*cos(yaw), cos(pitch)*sin(yaw), -sin(pitch)]
 
 `frame.json` 为 `protocol=rm_aim_sim/2`、`type=frame`，带 `encoding=rgb8/rgba8`、`frame_file/image_bytes/request_id/publisher_id`；像素按行紧密排列、左上角起始，无压缩、无 JPEG 编解码。文件名和大小必须与请求及相机宽高/通道数一致。每帧使用唯一文件名，避免元数据与不同尺寸像素错配；已打开的 inode 即使被删除仍可完成读取。
 
-其他元数据来自采样时的状态，去掉 `truth/events`。`camera.armors` 仍是诊断用理想角点，实际图像模式不应代替检测结果。`ipc` 包含 `enabled/last_seq`。世界姿态、相机姿态、tick、sim_time 和标定先固定，再在 `frame_post_draw` 后读回对应帧，不能用最新状态的姿态替换图像采样姿态。图像不叠加界面或准星。
+其他元数据来自采样时的状态，去掉 `truth/events`；顶层
+`ground_truth_angular_velocity` 会保留，并与该图像的 tick、sim_time 一致。`camera.armors`
+仍是诊断用理想角点，实际图像模式不应代替检测结果。`ipc` 包含 `enabled/last_seq`。世界姿态、
+相机姿态、tick、sim_time 和标定先固定，再在 `frame_post_draw` 后读回对应帧，不能用最新状态
+的姿态替换图像采样姿态。图像不叠加界面或准星。
 
 注意 frame 元数据不是逐字复制最新 state：它没有 `publication/wall_unix_sec`，也没有 `ipc.status/received/rejected`。图像新鲜度应用 `(publisher,session,request_id)`、采样时间以及客户端单调接收时刻判断，不要对 frame 强行使用状态包的 publication 校验。
 

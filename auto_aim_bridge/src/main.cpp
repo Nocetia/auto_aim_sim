@@ -411,6 +411,8 @@ int run(const Options & options)
   double current_sim_time = 0.0;
   bool active = false;
   bool stale_stop_was_sent = false;
+  bool latest_state_ground_truth_valid = false;
+  bool latest_observation_ground_truth_valid = false;
 
   const std::string operating_mode = options.control
     ? (options.allow_fire ? "CONTROL + FIRE" : "CONTROL")
@@ -442,6 +444,8 @@ int run(const Options & options)
       current_sim_time = state_snapshot.sim_time;
       active = state_snapshot.active;
       stale_stop_was_sent = false;
+      const bool state_ground_truth_valid =
+        state_snapshot.ground_truth_angular_velocity.has_value();
 
       const bool context_changed = current_context != state_snapshot.context;
       const bool time_reversed = previous_state_sim_time &&
@@ -454,17 +458,21 @@ int run(const Options & options)
         previous_observation_sim_time.reset();
         client.cancel_frame_request();
         worker.invalidate();
+        latest_observation_ground_truth_valid = false;
 
         std::cout << "Generation " << generation << ": session="
                   << state->at("session_id").get<std::string>()
                   << ", active=" << std::boolalpha << active << '\n';
       }
 
+      latest_state_ground_truth_valid = state_ground_truth_valid;
+
       if (options.input_mode == InputMode::exact_corners &&
           active &&
           (!previous_state_sim_time ||
            state_snapshot.sim_time > *previous_state_sim_time)) {
         previous_observation_sim_time = state_snapshot.sim_time;
+        latest_observation_ground_truth_valid = state_ground_truth_valid;
         worker.submit(std::move(state_snapshot), generation);
       }
 
@@ -486,6 +494,8 @@ int run(const Options & options)
 
         if (frame_is_current) {
           previous_observation_sim_time = observation.sim_time;
+          latest_observation_ground_truth_valid =
+            observation.ground_truth_angular_velocity.has_value();
           worker.submit(std::move(observation), generation);
         }
       }
@@ -507,8 +517,13 @@ int run(const Options & options)
 
     result = worker.latest_result();
     const bool has_current_result = result && result->generation == generation;
+    const bool ground_truth_inputs_current =
+      !has_current_result ||
+      !result->ground_truth_angular_velocity_enabled ||
+      (latest_state_ground_truth_valid && latest_observation_ground_truth_valid);
 
     const bool may_control = options.control && active && state_is_fresh && has_current_result &&
+      ground_truth_inputs_current &&
       command_is_current(*result, generation, current_sim_time, current_time);
 
     const bool planner_requests_fire = has_current_result && result->plan.fire;
@@ -546,6 +561,21 @@ int run(const Options & options)
           {"seq", published->sequence},
           {"control", published->control},
           {"tracker_state", result ? result->tracker_state : "waiting"},
+          {"omega_kf", has_current_result
+            ? result->diagnostics.value("omega_kf", Json(nullptr))
+            : Json(nullptr)},
+          {"omega_gt", has_current_result
+            ? result->diagnostics.value("omega_gt", Json(nullptr))
+            : Json(nullptr)},
+          {"omega_prediction", has_current_result
+            ? result->diagnostics.value("omega_prediction", Json(nullptr))
+            : Json(nullptr)},
+          {"angular_velocity_source", has_current_result
+            ? result->diagnostics.value(
+                "angular_velocity_source",
+                std::string("unavailable"))
+            : "waiting"},
+          {"ground_truth_inputs_current", ground_truth_inputs_current},
           {"planner_fire_intent", planner_requests_fire},
           {"fire", published->fire},
           {"yaw", command.yaw},

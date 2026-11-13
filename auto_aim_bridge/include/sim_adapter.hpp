@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -36,6 +37,16 @@ enum class EstimatorMode
 
 const char * estimator_mode_name(EstimatorMode estimator_mode);
 
+struct GroundTruthAngularVelocitySample
+{
+  std::string session_id;
+  std::int64_t target_id = -1;
+  std::string robot_id;
+  std::uint64_t tick = 0;
+  double timestamp = 0.0;
+  double yaw_rad_s = 0.0;
+};
+
 struct Observation
 {
   Json state;
@@ -48,6 +59,8 @@ struct Observation
   double sim_time = 0.0;
   double bullet_speed = 0.0;
   double firing_delay = 0.0;
+  std::optional<GroundTruthAngularVelocitySample> ground_truth_angular_velocity;
+  std::string ground_truth_angular_velocity_status = "missing";
   bool active = false;
 };
 
@@ -75,6 +88,7 @@ struct PipelineResult
   SteadyClock::time_point observation_received_at;
   auto_aim::Plan plan;
   std::string tracker_state = "lost";
+  bool ground_truth_angular_velocity_enabled = false;
   Json diagnostics;
 };
 
